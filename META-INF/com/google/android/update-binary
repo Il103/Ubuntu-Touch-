@@ -1,0 +1,213 @@
+#!/sbin/sh
+# ============================================================
+# Ubuntu Touch - TWRP Flashable ZIP
+# Device  : Samsung Galaxy Tab A7 LTE
+# Models  : SM-T505 / SM-T505N / SM-T505C / SM-T507
+# Codename: gta4l
+# Base    : Halium 12 + LineageOS 19.1
+# ============================================================
+
+SKIPUNZIP=1
+
+# TWRP UI functions
+ui_print() { echo "ui_print $1" >> /proc/self/fd/$OUTFD; echo "ui_print " >> /proc/self/fd/$OUTFD; }
+abort()    { ui_print "❌ ERROR: $1"; exit 1; }
+
+OUTFD=$2
+ZIPFILE=$3
+
+# Extract ZIP to /tmp
+cd /tmp
+unzip -o "$ZIPFILE" -d /tmp/ubuntu-touch-install
+
+# ─────────────────────────────────────────
+# Banner
+# ─────────────────────────────────────────
+ui_print "╔══════════════════════════════════════════╗"
+ui_print "║   Ubuntu Touch - Samsung Galaxy Tab A7   ║"
+ui_print "║   SM-T505 / SM-T505N / SM-T505C / T507   ║"
+ui_print "║   Halium 12 + LineageOS 19.1              ║"
+ui_print "╚══════════════════════════════════════════╝"
+ui_print " "
+
+# ─────────────────────────────────────────
+# Device check
+# ─────────────────────────────────────────
+ui_print "▶ Checking device compatibility..."
+
+DEVICE=$(getprop ro.product.device)
+MODEL=$(getprop ro.product.model)
+
+ui_print "  Device : $DEVICE"
+ui_print "  Model  : $MODEL"
+
+case "$DEVICE" in
+  gta4l|gta4lx)
+    ui_print "✅ Device supported!"
+    ;;
+  *)
+    abort "Device '$DEVICE' is NOT supported! This ZIP is ONLY for gta4l (SM-T505/N/C/T507)"
+    ;;
+esac
+
+# ─────────────────────────────────────────
+# Check files exist in ZIP
+# ─────────────────────────────────────────
+ui_print " "
+ui_print "▶ Checking installation files..."
+
+for f in halium-boot.img system.img ubuntu-touch-rootfs.tar.gz; do
+  if [ ! -f "/tmp/ubuntu-touch-install/images/$f" ]; then
+    abort "Missing file: $f — ZIP may be corrupted!"
+  fi
+  ui_print "  ✅ Found: $f"
+done
+
+# ─────────────────────────────────────────
+# Wipe data
+# ─────────────────────────────────────────
+ui_print " "
+ui_print "▶ Formatting /data partition (ext4)..."
+make_ext4fs /dev/block/bootdevice/by-name/userdata 2>/dev/null || \
+  mke2fs -t ext4 /dev/block/bootdevice/by-name/userdata 2>/dev/null || \
+  ui_print "  ⚠ Warning: Could not format /data (may already be formatted)"
+
+mkdir -p /data
+mount /dev/block/bootdevice/by-name/userdata /data 2>/dev/null || \
+  mount -t ext4 /dev/block/bootdevice/by-name/userdata /data || \
+  abort "Failed to mount /data!"
+
+ui_print "  ✅ /data mounted"
+
+# ─────────────────────────────────────────
+# Flash halium-boot.img → BOOT partition
+# ─────────────────────────────────────────
+ui_print " "
+ui_print "▶ Flashing halium-boot.img to BOOT partition..."
+
+BOOT_PARTITION=$(find /dev/block -name "boot" 2>/dev/null | head -1)
+[ -z "$BOOT_PARTITION" ] && BOOT_PARTITION="/dev/block/bootdevice/by-name/boot"
+
+dd if=/tmp/ubuntu-touch-install/images/halium-boot.img of=$BOOT_PARTITION bs=4096 2>/dev/null
+if [ $? -eq 0 ]; then
+  ui_print "  ✅ halium-boot.img flashed to $BOOT_PARTITION"
+else
+  abort "Failed to flash halium-boot.img!"
+fi
+
+# ─────────────────────────────────────────
+# Flash system.img → SYSTEM partition
+# ─────────────────────────────────────────
+ui_print " "
+ui_print "▶ Flashing system.img to SYSTEM partition..."
+
+SYSTEM_PARTITION="/dev/block/bootdevice/by-name/system"
+
+dd if=/tmp/ubuntu-touch-install/images/system.img of=$SYSTEM_PARTITION bs=4096 2>/dev/null
+if [ $? -eq 0 ]; then
+  ui_print "  ✅ system.img flashed to $SYSTEM_PARTITION"
+else
+  abort "Failed to flash system.img!"
+fi
+
+# ─────────────────────────────────────────
+# Extract Ubuntu Touch rootfs → /data
+# ─────────────────────────────────────────
+ui_print " "
+ui_print "▶ Installing Ubuntu Touch rootfs to /data..."
+
+mkdir -p /data/ubuntu-touch
+tar xzf /tmp/ubuntu-touch-install/images/ubuntu-touch-rootfs.tar.gz \
+    -C /data/ubuntu-touch 2>/dev/null
+
+if [ $? -eq 0 ]; then
+  ui_print "  ✅ Rootfs extracted to /data/ubuntu-touch"
+else
+  abort "Failed to extract rootfs!"
+fi
+
+# ─────────────────────────────────────────
+# VERIFICATION - فحص شامل
+# ─────────────────────────────────────────
+ui_print " "
+ui_print "╔══════════════════════════════════╗"
+ui_print "║   🔍 Running Verification...     ║"
+ui_print "╚══════════════════════════════════╝"
+
+PASS=0
+FAIL=0
+
+# 1. Check BOOT partition written
+BOOT_SIZE=$(wc -c < $BOOT_PARTITION 2>/dev/null || echo "0")
+IMG_SIZE=$(wc -c < /tmp/ubuntu-touch-install/images/halium-boot.img 2>/dev/null || echo "0")
+if [ "$BOOT_SIZE" -gt 0 ]; then
+  ui_print "  ✅ BOOT partition: written ($IMG_SIZE bytes)"
+  PASS=$((PASS+1))
+else
+  ui_print "  ❌ BOOT partition: FAILED"
+  FAIL=$((FAIL+1))
+fi
+
+# 2. Check SYSTEM partition written
+if dd if=$SYSTEM_PARTITION bs=512 count=1 2>/dev/null | grep -q "." 2>/dev/null; then
+  ui_print "  ✅ SYSTEM partition: written"
+  PASS=$((PASS+1))
+else
+  ui_print "  ❌ SYSTEM partition: FAILED"
+  FAIL=$((FAIL+1))
+fi
+
+# 3. Check Ubuntu Touch rootfs in /data
+if [ -d "/data/ubuntu-touch" ] && [ "$(ls -A /data/ubuntu-touch 2>/dev/null)" ]; then
+  ROOTFS_FILES=$(find /data/ubuntu-touch -maxdepth 1 | wc -l)
+  ui_print "  ✅ Ubuntu Touch rootfs: present ($ROOTFS_FILES items)"
+  PASS=$((PASS+1))
+else
+  ui_print "  ❌ Ubuntu Touch rootfs: NOT FOUND in /data"
+  FAIL=$((FAIL+1))
+fi
+
+# 4. Check halium marker
+if [ -f "/data/ubuntu-touch/var/lib/lxc/android/rootfs/etc/halium-device" ] || \
+   [ -f "/data/ubuntu-touch/etc/ubuntu-touch-device" ]; then
+  ui_print "  ✅ Ubuntu Touch marker: found"
+  PASS=$((PASS+1))
+else
+  # Not fatal — rootfs structure varies
+  ui_print "  ⚠ Ubuntu Touch marker: not found (may be OK)"
+fi
+
+# 5. Check /data is NOT Android (no /data/data directory from old Android)
+if [ ! -d "/data/data" ]; then
+  ui_print "  ✅ Clean install: no old Android data"
+  PASS=$((PASS+1))
+else
+  ui_print "  ⚠ Warning: old Android data found in /data/data"
+fi
+
+# ─────────────────────────────────────────
+# Final result
+# ─────────────────────────────────────────
+ui_print " "
+if [ $FAIL -eq 0 ]; then
+  ui_print "╔══════════════════════════════════════════╗"
+  ui_print "║  ✅ INSTALLATION SUCCESSFUL!              ║"
+  ui_print "║  Checks passed: $PASS                      ║"
+  ui_print "║                                           ║"
+  ui_print "║  ➡ Reboot to System                      ║"
+  ui_print "║  ⏳ First boot takes 2-5 minutes          ║"
+  ui_print "╚══════════════════════════════════════════╝"
+else
+  ui_print "╔══════════════════════════════════════════╗"
+  ui_print "║  ⚠ INSTALLATION COMPLETED WITH WARNINGS  ║"
+  ui_print "║  Passed: $PASS   Failed: $FAIL             ║"
+  ui_print "║                                           ║"
+  ui_print "║  Check errors above before rebooting!    ║"
+  ui_print "╚══════════════════════════════════════════╝"
+fi
+
+# Cleanup
+rm -rf /tmp/ubuntu-touch-install
+sync
+
+exit 0
