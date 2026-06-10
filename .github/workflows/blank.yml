@@ -1,0 +1,222 @@
+name: Build Ubuntu Touch - gta4l
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Halium 12 - gta4l
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get clean
+          df -h
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            git-core gnupg flex bison build-essential zip curl \
+            zlib1g-dev gcc-multilib g++-multilib libc6-dev-i386 \
+            lib32ncurses5-dev x11proto-core-dev libx11-dev lib32z-dev \
+            ccache libgl1-mesa-dev libxml2-utils xsltproc unzip \
+            fontconfig bc python-is-python3 python3-pip lzop \
+            libssl-dev libelf-dev schedtool liblz4-tool openjdk-11-jdk repo
+
+      - name: Configure git
+        run: |
+          git config --global user.email "build@gta4l.local"
+          git config --global user.name "gta4l Builder"
+          git config --global color.ui false
+
+      - name: Init Halium 12.0
+        run: |
+          mkdir -p ~/halium && cd ~/halium
+          repo init \
+            -u https://github.com/Halium/android \
+            -b halium-12.0 \
+            --depth=1 \
+            --no-clone-bundle
+
+      - name: Setup local manifests
+        run: |
+          mkdir -p ~/halium/.repo/local_manifests
+          cat > ~/halium/.repo/local_manifests/gta4l.xml << 'MANIFEST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <manifest>
+            <remote name="lineageos"
+                    fetch="https://github.com/LineageOS"
+                    revision="lineage-19.1" />
+            <remote name="themuppets"
+                    fetch="https://github.com/TheMuppets"
+                    revision="lineage-19.1" />
+            <project name="android_device_samsung_gta4l"
+                     path="device/samsung/gta4l"
+                     remote="lineageos"
+                     revision="lineage-19.1" />
+            <project name="android_device_samsung_gta4l-common"
+                     path="device/samsung/gta4l-common"
+                     remote="lineageos"
+                     revision="lineage-19.1" />
+            <project name="android_kernel_samsung_sm6115"
+                     path="kernel/samsung/sm6115"
+                     remote="lineageos"
+                     revision="lineage-19.1" />
+            <project name="proprietary_vendor_samsung_gta4l"
+                     path="vendor/samsung/gta4l"
+                     remote="themuppets"
+                     revision="lineage-19.1" />
+            <project name="proprietary_vendor_samsung_gta4l-common"
+                     path="vendor/samsung/gta4l-common"
+                     remote="themuppets"
+                     revision="lineage-19.1" />
+          </manifest>
+          MANIFEST
+
+      - name: Repo sync
+        run: |
+          cd ~/halium
+          repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags
+
+      - name: Apply Halium hybris patches
+        run: |
+          cd ~/halium
+          hybris-patches/apply-patches.sh --mb
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-halium12-gta4l-${{ github.run_id }}
+          restore-keys: ccache-halium12-gta4l-
+
+      - name: Build halium-boot.img
+        run: |
+          cd ~/halium
+          export USE_CCACHE=1 CCACHE_DIR=~/.ccache LANG=C LC_ALL=POSIX
+          ccache -M 10G
+          source build/envsetup.sh
+          breakfast gta4l
+          mka halium-boot
+
+      - name: Build system.img
+        run: |
+          cd ~/halium
+          export USE_CCACHE=1 CCACHE_DIR=~/.ccache LANG=C LC_ALL=POSIX
+          source build/envsetup.sh
+          lunch lineage_gta4l-eng
+          mka systemimage
+
+      - name: Download Ubuntu Touch rootfs
+        run: |
+          wget -q \
+            https://cdimage.ubports.com/ubuntu-touch/edge/channel/halium/ubuntu-touch-android12-arm64-rootfs.tar.gz \
+            -O ~/ubuntu-touch-rootfs.tar.gz
+
+      - name: Package TWRP flashable ZIP
+        run: |
+          mkdir -p ~/flashable/META-INF/com/google/android
+          mkdir -p ~/flashable/images
+
+          # Copy images
+          cp ~/halium/out/target/product/gta4l/halium-boot.img ~/flashable/images/
+          cp ~/halium/out/target/product/gta4l/system.img      ~/flashable/images/
+          cp ~/ubuntu-touch-rootfs.tar.gz                      ~/flashable/images/
+
+          # update-binary (سكريبت الفلاش)
+          cat > ~/flashable/META-INF/com/google/android/update-binary << 'SCRIPT'
+          #!/sbin/sh
+          OUTFD=$2
+          ZIPFILE=$3
+          ui_print() { echo "ui_print $1" >> /proc/self/fd/$OUTFD; echo "ui_print " >> /proc/self/fd/$OUTFD; }
+          abort()    { ui_print "ERROR: $1"; exit 1; }
+
+          cd /tmp
+          unzip -o "$ZIPFILE" -d /tmp/ut-install
+
+          ui_print "╔══════════════════════════════════╗"
+          ui_print "║  Ubuntu Touch - gta4l SM-T505N   ║"
+          ui_print "║  Halium 12 + LineageOS 19.1       ║"
+          ui_print "╚══════════════════════════════════╝"
+
+          # Device check
+          DEVICE=$(getprop ro.product.device)
+          case "$DEVICE" in
+            gta4l|gta4lx) ui_print "✅ Device OK: $DEVICE" ;;
+            *) abort "Wrong device: $DEVICE — only gta4l supported!" ;;
+          esac
+
+          # Format /data
+          ui_print "▶ Formatting /data..."
+          mke2fs -t ext4 /dev/block/bootdevice/by-name/userdata 2>/dev/null
+          mount -t ext4 /dev/block/bootdevice/by-name/userdata /data || abort "Cannot mount /data!"
+
+          # Flash halium-boot.img
+          ui_print "▶ Flashing halium-boot.img..."
+          dd if=/tmp/ut-install/images/halium-boot.img of=/dev/block/bootdevice/by-name/boot bs=4096 \
+            || abort "Failed to flash boot!"
+          ui_print "✅ Boot flashed"
+
+          # Flash system.img
+          ui_print "▶ Flashing system.img..."
+          dd if=/tmp/ut-install/images/system.img of=/dev/block/bootdevice/by-name/system bs=4096 \
+            || abort "Failed to flash system!"
+          ui_print "✅ System flashed"
+
+          # Extract rootfs
+          ui_print "▶ Extracting Ubuntu Touch rootfs..."
+          mkdir -p /data/ubuntu-touch
+          tar xzf /tmp/ut-install/images/ubuntu-touch-rootfs.tar.gz -C /data/ubuntu-touch \
+            || abort "Failed to extract rootfs!"
+          ui_print "✅ Rootfs extracted"
+
+          # Verify
+          ui_print "▶ Verifying installation..."
+          [ -d "/data/ubuntu-touch" ] && [ "$(ls -A /data/ubuntu-touch)" ] \
+            && ui_print "✅ Ubuntu Touch installed successfully!" \
+            || ui_print "⚠ Warning: rootfs may be incomplete"
+
+          rm -rf /tmp/ut-install
+          sync
+
+          ui_print "╔══════════════════════════════════╗"
+          ui_print "║  ✅ DONE! Reboot to System        ║"
+          ui_print "║  ⏳ First boot = 2-5 minutes      ║"
+          ui_print "╚══════════════════════════════════╝"
+          exit 0
+          SCRIPT
+
+          # updater-script dummy
+          echo "# Ubuntu Touch gta4l" > ~/flashable/META-INF/com/google/android/updater-script
+
+          chmod +x ~/flashable/META-INF/com/google/android/update-binary
+
+          # Build ZIP
+          DATE=$(date +%Y%m%d)
+          ZIPNAME="UbuntuTouch-Halium12-gta4l-${DATE}.zip"
+          cd ~/flashable
+          zip -r9 ~/${ZIPNAME} .
+          sha256sum ~/${ZIPNAME} > ~/${ZIPNAME}.sha256
+          echo "ZIP_NAME=${ZIPNAME}" >> $GITHUB_ENV
+          ls -lh ~/${ZIPNAME}
+
+      - name: Upload flashable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: UbuntuTouch-gta4l-FlashableZIP
+          path: |
+            ~/${{ env.ZIP_NAME }}
+            ~/${{ env.ZIP_NAME }}.sha256
+          retention-days: 7
+
+      - name: Upload build logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-logs
+          path: ~/halium/out/target/product/gta4l/*.log
+          retention-days: 3
