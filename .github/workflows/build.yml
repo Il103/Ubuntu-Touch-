@@ -25,13 +25,20 @@ jobs:
             lib32ncurses5-dev x11proto-core-dev libx11-dev lib32z-dev \
             ccache libgl1-mesa-dev libxml2-utils xsltproc unzip \
             fontconfig bc python-is-python3 python3-pip lzop \
-            libssl-dev libelf-dev schedtool liblz4-tool openjdk-11-jdk repo
+            libssl-dev libelf-dev schedtool liblz4-tool openjdk-11-jdk
 
       - name: Configure git
         run: |
           git config --global user.email "build@gta4l.local"
           git config --global user.name "gta4l Builder"
           git config --global color.ui false
+
+      - name: Install latest repo tool
+        run: |
+          mkdir -p ~/.bin
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/.bin/repo
+          chmod a+x ~/.bin/repo
+          echo "$HOME/.bin" >> $GITHUB_PATH
 
       - name: Init Halium 12.0
         run: |
